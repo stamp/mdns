@@ -6,8 +6,6 @@ import (
 	"os"
 	"strings"
 
-	"bytes"
-	//"github.com/davecgh/go-spew/spew"
 	"github.com/miekg/dns"
 )
 
@@ -149,7 +147,6 @@ func (m *MDNSService) Records(q dns.Question) []dns.RR {
 
 // Records returns DNS records in response to a DNS question and patch the responses based on the address it was received from
 func (m *MDNSService) RecordsFrom(q dns.Question, from net.Addr) []dns.RR {
-	fmt.Printf("Received question from %s\n", from)
 	answer := m.Records(q)
 
 	var ip net.IP
@@ -177,7 +174,7 @@ func (m *MDNSService) RecordsFrom(q dns.Question, from net.Addr) []dns.RR {
 		for _, a := range addrs {
 			switch v := a.(type) {
 			case *net.IPNet:
-				if matchIpAndNet(ip, *v) {
+				if v.Contains(ip) {
 					// We found the source interface, add it to the answers if needed
 					return m.records(q, v.IP)
 				}
@@ -204,35 +201,6 @@ func (m *MDNSService) records(q dns.Question, intf net.IP) []dns.RR {
 	default:
 		return nil
 	}
-}
-
-func matchIpAndNet(ipB net.IP, n net.IPNet) bool {
-	// check if same type of address (v4/6)
-	if (ipB.To4() == nil) != (n.IP.To4() == nil) {
-		return false
-	}
-
-	// Make a copy so we dont destroy the original address
-	ipA := make(net.IP, len(n.IP))
-	copy(ipA, n.IP)
-
-	a := ipA.To16()
-	b := ipB.To16()
-
-	// Apply netmask
-	if ipA.To4() != nil {
-		for i := 0; i < 4; i++ {
-			a[i+12] &= n.Mask[i]
-			b[i+12] &= n.Mask[i]
-		}
-	} else {
-		for i, m := range n.Mask {
-			a[i] &= m
-			b[i] &= m
-		}
-	}
-
-	return bytes.Equal(a, b)
 }
 
 func (m *MDNSService) serviceEnum(q dns.Question, intf net.IP) []dns.RR {
