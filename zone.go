@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 
+	"bytes"
+	//"github.com/davecgh/go-spew/spew"
 	"github.com/miekg/dns"
 )
 
@@ -19,21 +21,23 @@ const (
 type Zone interface {
 	// Records returns DNS records in response to a DNS question.
 	Records(q dns.Question) []dns.RR
+	RecordsFrom(q dns.Question, from net.Addr) []dns.RR
 }
 
 // MDNSService is used to export a named service by implementing a Zone
 type MDNSService struct {
-	Instance     string   // Instance name (e.g. "hostService name")
-	Service      string   // Service name (e.g. "_http._tcp.")
-	Domain       string   // If blank, assumes "local"
-	HostName     string   // Host machine DNS name (e.g. "mymachine.net.")
-	Port         int      // Service Port
-	IPs          []net.IP // IP addresses for the service's host
-	TXT          []string // Service TXT records
-	TTL          uint32
-	serviceAddr  string // Fully qualified service address
-	instanceAddr string // Fully qualified instance address
-	enumAddr     string // _services._dns-sd._udp.<domain>
+	Instance           string   // Instance name (e.g. "hostService name")
+	Service            string   // Service name (e.g. "_http._tcp.")
+	Domain             string   // If blank, assumes "local"
+	HostName           string   // Host machine DNS name (e.g. "mymachine.net.")
+	Port               int      // Service Port
+	IPs                []net.IP // IP addresses for the service's host
+	TXT                []string // Service TXT records
+	TTL                uint32
+	UseSourceInterface bool   // When no IPs is provided, use the address of the interface where the request arrived from
+	serviceAddr        string // Fully qualified service address
+	instanceAddr       string // Fully qualified instance address
+	enumAddr           string // _services._dns-sd._udp.<domain>
 }
 
 // validateFQDN returns an error if the passed string is not a fully qualified
@@ -81,12 +85,15 @@ func NewMDNSService(instance, service, domain, hostName string, port int, ips []
 	}
 
 	// Get host information if no host is specified.
+	useSourceInterface := false
 	if hostName == "" {
 		var err error
 		hostName, err = os.Hostname()
 		if err != nil {
 			return nil, fmt.Errorf("could not determine host: %v", err)
 		}
+
+		useSourceInterface = len(ips) == 0 // Nether hostname nor ip was provided, use the source interface address instead
 		hostName = fmt.Sprintf("%s.", hostName)
 	}
 	if err := validateFQDN(hostName); err != nil {
@@ -115,17 +122,18 @@ func NewMDNSService(instance, service, domain, hostName string, port int, ips []
 	}
 
 	return &MDNSService{
-		Instance:     instance,
-		Service:      service,
-		Domain:       domain,
-		HostName:     hostName,
-		Port:         port,
-		IPs:          ips,
-		TXT:          txt,
-		TTL:          defaultTTL,
-		serviceAddr:  fmt.Sprintf("%s.%s.", trimDot(service), trimDot(domain)),
-		instanceAddr: fmt.Sprintf("%s.%s.%s.", instance, trimDot(service), trimDot(domain)),
-		enumAddr:     fmt.Sprintf("_services._dns-sd._udp.%s.", trimDot(domain)),
+		Instance:           instance,
+		Service:            service,
+		Domain:             domain,
+		HostName:           hostName,
+		Port:               port,
+		IPs:                ips,
+		TXT:                txt,
+		TTL:                defaultTTL,
+		UseSourceInterface: useSourceInterface,
+		serviceAddr:        fmt.Sprintf("%s.%s.", trimDot(service), trimDot(domain)),
+		instanceAddr:       fmt.Sprintf("%s.%s.%s.", instance, trimDot(service), trimDot(domain)),
+		enumAddr:           fmt.Sprintf("_services._dns-sd._udp.%s.", trimDot(domain)),
 	}, nil
 }
 
@@ -136,16 +144,61 @@ func trimDot(s string) string {
 
 // Records returns DNS records in response to a DNS question.
 func (m *MDNSService) Records(q dns.Question) []dns.RR {
+	return m.records(q, nil)
+}
+
+// Records returns DNS records in response to a DNS question and patch the responses based on the address it was received from
+func (m *MDNSService) RecordsFrom(q dns.Question, from net.Addr) []dns.RR {
+	fmt.Printf("Received question from %s\n", from)
+	answer := m.Records(q)
+
+	var ip net.IP
+	switch v := from.(type) {
+	case *net.UDPAddr:
+		ip = v.IP
+	case *net.TCPAddr:
+		ip = v.IP
+	case *net.IPAddr:
+		ip = v.IP
+	case *net.IPNet:
+		ip = v.IP
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return answer
+	}
+
+	for _, i := range ifaces {
+		addrs, err := i.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			switch v := a.(type) {
+			case *net.IPNet:
+				if matchIpAndNet(ip, *v) {
+					// We found the source interface, add it to the answers if needed
+					return m.records(q, v.IP)
+				}
+			}
+
+		}
+	}
+	return answer
+}
+
+func (m *MDNSService) records(q dns.Question, intf net.IP) []dns.RR {
 	switch q.Name {
 	case m.enumAddr:
-		return m.serviceEnum(q)
+		return m.serviceEnum(q, intf)
 	case m.serviceAddr:
-		return m.serviceRecords(q)
+		return m.serviceRecords(q, intf)
 	case m.instanceAddr:
-		return m.instanceRecords(q)
+		return m.instanceRecords(q, intf)
 	case m.HostName:
 		if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA {
-			return m.instanceRecords(q)
+			return m.instanceRecords(q, intf)
 		}
 		fallthrough
 	default:
@@ -153,7 +206,36 @@ func (m *MDNSService) Records(q dns.Question) []dns.RR {
 	}
 }
 
-func (m *MDNSService) serviceEnum(q dns.Question) []dns.RR {
+func matchIpAndNet(ipB net.IP, n net.IPNet) bool {
+	// check if same type of address (v4/6)
+	if (ipB.To4() == nil) != (n.IP.To4() == nil) {
+		return false
+	}
+
+	// Make a copy so we dont destroy the original address
+	ipA := make(net.IP, len(n.IP))
+	copy(ipA, n.IP)
+
+	a := ipA.To16()
+	b := ipB.To16()
+
+	// Apply netmask
+	if ipA.To4() != nil {
+		for i := 0; i < 4; i++ {
+			a[i+12] &= n.Mask[i]
+			b[i+12] &= n.Mask[i]
+		}
+	} else {
+		for i, m := range n.Mask {
+			a[i] &= m
+			b[i] &= m
+		}
+	}
+
+	return bytes.Equal(a, b)
+}
+
+func (m *MDNSService) serviceEnum(q dns.Question, intf net.IP) []dns.RR {
 	switch q.Qtype {
 	case dns.TypeANY:
 		fallthrough
@@ -174,7 +256,7 @@ func (m *MDNSService) serviceEnum(q dns.Question) []dns.RR {
 }
 
 // serviceRecords is called when the query matches the service name
-func (m *MDNSService) serviceRecords(q dns.Question) []dns.RR {
+func (m *MDNSService) serviceRecords(q dns.Question, intf net.IP) []dns.RR {
 	switch q.Qtype {
 	case dns.TypeANY:
 		fallthrough
@@ -195,7 +277,7 @@ func (m *MDNSService) serviceRecords(q dns.Question) []dns.RR {
 		instRecs := m.instanceRecords(dns.Question{
 			Name:  m.instanceAddr,
 			Qtype: dns.TypeANY,
-		})
+		}, intf)
 
 		// Return the service record with the instance records
 		return append(servRec, instRecs...)
@@ -205,24 +287,42 @@ func (m *MDNSService) serviceRecords(q dns.Question) []dns.RR {
 }
 
 // serviceRecords is called when the query matches the instance name
-func (m *MDNSService) instanceRecords(q dns.Question) []dns.RR {
+func (m *MDNSService) instanceRecords(q dns.Question, intf net.IP) []dns.RR {
 	switch q.Qtype {
 	case dns.TypeANY:
 		// Get the SRV, which includes A and AAAA
 		recs := m.instanceRecords(dns.Question{
 			Name:  m.instanceAddr,
 			Qtype: dns.TypeSRV,
-		})
+		}, intf)
 
 		// Add the TXT record
 		recs = append(recs, m.instanceRecords(dns.Question{
 			Name:  m.instanceAddr,
 			Qtype: dns.TypeTXT,
-		})...)
+		}, intf)...)
 		return recs
 
 	case dns.TypeA:
 		var rr []dns.RR
+
+		// Answer with the source interface address if available
+		if m.UseSourceInterface && intf != nil {
+			// Only answer if the source address was a v4 address
+			if intf.To4() != nil {
+				rr = append(rr, &dns.A{
+					Hdr: dns.RR_Header{
+						Name:   m.HostName,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    m.TTL,
+					},
+					A: intf,
+				})
+			}
+			return rr
+		}
+
 		for _, ip := range m.IPs {
 			if ip4 := ip.To4(); ip4 != nil {
 				rr = append(rr, &dns.A{
@@ -240,6 +340,24 @@ func (m *MDNSService) instanceRecords(q dns.Question) []dns.RR {
 
 	case dns.TypeAAAA:
 		var rr []dns.RR
+
+		// Answer with the source interface address if available
+		if m.UseSourceInterface && intf != nil {
+			// Only answer if the source address was a v6 address
+			if intf.To4() == nil {
+				rr = append(rr, &dns.A{
+					Hdr: dns.RR_Header{
+						Name:   m.HostName,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    m.TTL,
+					},
+					A: intf,
+				})
+			}
+			return rr
+		}
+
 		for _, ip := range m.IPs {
 			if ip.To4() != nil {
 				// TODO(reddaly): IPv4 addresses could be encoded in IPv6 format and
@@ -283,13 +401,13 @@ func (m *MDNSService) instanceRecords(q dns.Question) []dns.RR {
 		recs = append(recs, m.instanceRecords(dns.Question{
 			Name:  m.instanceAddr,
 			Qtype: dns.TypeA,
-		})...)
+		}, intf)...)
 
 		// Add the AAAA record
 		recs = append(recs, m.instanceRecords(dns.Question{
 			Name:  m.instanceAddr,
 			Qtype: dns.TypeAAAA,
-		})...)
+		}, intf)...)
 		return recs
 
 	case dns.TypeTXT:
